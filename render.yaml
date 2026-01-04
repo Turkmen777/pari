@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: telegram-payment-bot
+    env: python
+    region: frankfurt  # Ближайший к Туркменистану
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 120
+    envVars:
+      - key: BOT_TOKEN
+        sync: 8123803682:AAENNoQJnT63ErS5w0JdPg8r4q-sxx28rBs
+      - key: GROUP_CHAT_ID
+        value: "-1003663534213"
+      - key: ADMIN_IDS
+        value: "8444800411"
+      - key: MIN_AMOUNT
+        value: "50"
+      - key: PORT
+        value: "10000"
+    autoDeploy: true
