@@ -1,392 +1,307 @@
 import logging
-import asyncio
-from datetime import datetime
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
-from threading import Thread
-import time
-
-from config import *
+import os
+from flask import Flask, request, jsonify
+import telegram
+from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters, ConversationHandler
+import re
 
 # Настройка логирования
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
-    handlers=[
-        logging.FileHandler('bot.log'),
-        logging.StreamHandler()
-    ]
-)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# В памяти
-deposits = []
-next_id = 1000
-
-# Состояния
-WAITING_ID, WAITING_AMOUNT = range(2)
-
-# ========== КЛИЕНТСКАЯ ЧАСТЬ ==========
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[KeyboardButton("💰 Пополнить счет")]]
-    await update.message.reply_text(
-        "Привет! Нажмите кнопку:",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    )
-
-async def handle_deposit_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Введите ваш ID:")
-    return WAITING_ID
-
-async def handle_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['client_id'] = update.message.text
-    await update.message.reply_text("Введите сумму (мин. 50 TMT):")
-    return WAITING_AMOUNT
-
-async def handle_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        amount = float(update.message.text.replace(',', '.'))
-        
-        if amount < MIN_AMOUNT:
-            await update.message.reply_text(f"❌ Минимум {MIN_AMOUNT} TMT")
-            return WAITING_AMOUNT
-        
-        global next_id, deposits
-        
-        # Создаем заявку
-        deposit = {
-            'id': next_id,
-            'user_id': update.effective_user.id,
-            'user_name': update.effective_user.first_name,
-            'client_id': context.user_data['client_id'],
-            'amount': amount,
-            'time': datetime.now().strftime("%H:%M %d.%m.%Y"),
-            'status': 'waiting'
-        }
-        
-        deposits.append(deposit)
-        
-        # Клиенту
-        await update.message.reply_text(
-            f"✅ Заявка #{next_id} принята!\nОжидайте реквизиты..."
-        )
-        
-        # ========== ОТПРАВКА В ГРУППУ ==========
-        try:
-            group_text = f"""
-🆕 <b>НОВАЯ ЗАЯВКА #{next_id}</b>
-
-👤 Клиент: {update.effective_user.first_name}
-📞 ID: {context.user_data['client_id']}
-💰 Сумма: {amount} TMT
-⏰ Время: {deposit['time']}
-
-<b>Отправьте номер телефона для клиента:</b>
-(8 цифр, например: 65656565)
-            """
-            
-            await context.bot.send_message(
-                chat_id=GROUP_CHAT_ID,
-                text=group_text,
-                parse_mode='HTML'
-            )
-            
-            logger.info(f"✅ Заявка #{next_id} отправлена в группу {GROUP_CHAT_ID}")
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка отправки в группу: {e}")
-            await update.message.reply_text(f"Ошибка: {e}")
-        
-        next_id += 1
-        return ConversationHandler.END
-        
-    except ValueError:
-        await update.message.reply_text("❌ Введите число!")
-        return WAITING_AMOUNT
-
-# ========== ОБРАБОТКА ГРУППЫ ==========
-async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка текстовых сообщений в группе"""
-    
-    # Проверяем, что это наша группа
-    if update.effective_chat.id != GROUP_CHAT_ID:
-        return
-    
-    # Проверяем, что это админ
-    if update.effective_user.id not in ADMIN_IDS:
-        logger.info(f"Сообщение от не-админа: {update.effective_user.id}")
-        return
-    
-    text = update.message.text.strip()
-    logger.info(f"Сообщение в группе от админа: {text}")
-    
-    # Проверяем, 8 ли это цифр
-    if text.isdigit() and len(text) == 8:
-        logger.info(f"Распознан номер: {text}")
-        
-        # Ищем последнюю заявку без номера
-        last_deposit = None
-        for deposit in deposits:
-            if deposit['status'] == 'waiting' and 'phone' not in deposit:
-                last_deposit = deposit
-                break
-        
-        if not last_deposit:
-            await update.message.reply_text("❌ Нет заявок, ожидающих номер")
-            logger.info("Нет заявок для номера")
-            return
-        
-        logger.info(f"Найдена заявка для номера: {last_deposit['id']}")
-        
-        # Форматируем номер
-        phone = f"+993 {text[:2]} {text[2:5]} {text[5:]}"
-        last_deposit['phone'] = phone
-        
-        # Отправляем клиенту
-        try:
-            await context.bot.send_message(
-                chat_id=last_deposit['user_id'],
-                text=f"💳 <b>РЕКВИЗИТЫ ДЛЯ ОПЛАТЫ</b>\n\n"
-                     f"📱 Номер: <code>{phone}</code>\n"
-                     f"💰 Сумма: {last_deposit['amount']} TMT\n\n"
-                     f"После оплаты отправьте скриншот!",
-                parse_mode='HTML'
-            )
-            
-            logger.info(f"✅ Номер отправлен клиенту {last_deposit['user_id']}")
-            
-            # В группе подтверждаем
-            await update.message.reply_text(
-                f"✅ <b>Реквизиты отправлены клиенту #{last_deposit['id']}</b>\n\n"
-                f"👤 Клиент: {last_deposit['user_name']}\n"
-                f"📱 Номер: {phone}\n"
-                f"💰 Сумма: {last_deposit['amount']} TMT",
-                parse_mode='HTML'
-            )
-            
-            # Создаем кнопку для подтверждения оплаты
-            keyboard = [[
-                InlineKeyboardButton("✅ Подтвердить оплату", callback_data=f"confirm_{last_deposit['id']}")
-            ]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await context.bot.send_message(
-                chat_id=GROUP_CHAT_ID,
-                text=f"⏳ Ожидаем скриншот от клиента #{last_deposit['id']}",
-                reply_markup=reply_markup
-            )
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка отправки клиенту: {e}")
-            await update.message.reply_text(f"❌ Ошибка: {e}")
-    
-    # Команда для админа
-    elif text == "/list":
-        waiting = [d for d in deposits if d['status'] == 'waiting' and 'phone' not in d]
-        
-        if not waiting:
-            await update.message.reply_text("⏳ Нет ожидающих заявок")
-            return
-        
-        msg = "⏳ <b>Ожидают номер:</b>\n\n"
-        for d in waiting:
-            msg += f"🆔 #{d['id']} - {d['user_name']} - {d['amount']} TMT\n"
-        
-        await update.message.reply_text(msg, parse_mode='HTML')
-
-# ========== СКРИНШОТЫ ==========
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка фото (скриншотов)"""
-    
-    user_id = update.effective_user.id
-    
-    # Ищем заявку пользователя
-    user_deposit = None
-    for deposit in deposits:
-        if deposit['user_id'] == user_id and deposit.get('phone') and deposit['status'] == 'waiting':
-            user_deposit = deposit
-            break
-    
-    if not user_deposit:
-        await update.message.reply_text("❌ Нет активной заявки")
-        return
-    
-    await update.message.reply_text("✅ Скриншот получен! Ожидайте подтверждения")
-    
-    # Пересылаем в группу
-    try:
-        photo = update.message.photo[-1]
-        
-        # Отправляем фото
-        await context.bot.send_photo(
-            chat_id=GROUP_CHAT_ID,
-            photo=photo.file_id,
-            caption=f"📸 Скриншот оплаты #{user_deposit['id']}"
-        )
-        
-        # Создаем кнопку для подтверждения
-        keyboard = [[
-            InlineKeyboardButton("✅ Подтвердить оплату", callback_data=f"confirm_{user_deposit['id']}")
-        ]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await context.bot.send_message(
-            chat_id=GROUP_CHAT_ID,
-            text=f"✅ Скриншот получен от клиента #{user_deposit['id']}",
-            reply_markup=reply_markup
-        )
-        
-        logger.info(f"✅ Скриншот от клиента #{user_deposit['id']} отправлен в группу")
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка отправки скриншота: {e}")
-
-# ========== ПОДТВЕРЖДЕНИЕ ОПЛАТЫ ==========
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data.startswith("confirm_"):
-        deposit_id = int(query.data.split("_")[1])
-        
-        # Проверяем админа
-        if query.from_user.id not in ADMIN_IDS:
-            await query.answer("❌ Только администратор", show_alert=True)
-            return
-        
-        # Ищем заявку
-        deposit = None
-        for d in deposits:
-            if d['id'] == deposit_id:
-                deposit = d
-                break
-        
-        if not deposit:
-            await query.answer("❌ Заявка не найдена", show_alert=True)
-            return
-        
-        # Обновляем статус
-        deposit['status'] = 'completed'
-        deposit['confirmed_by'] = query.from_user.first_name
-        deposit['confirmed_time'] = datetime.now().strftime("%H:%M:%S")
-        
-        # Обновляем сообщение в группе
-        await query.edit_message_text(
-            f"✅ <b>ПЛАТЕЖ ПОДТВЕРЖДЕН #{deposit_id}</b>\n\n"
-            f"👤 Клиент: {deposit['user_name']}\n"
-            f"💰 Сумма: {deposit['amount']} TMT\n"
-            f"👨‍💼 Подтвердил: {query.from_user.first_name}",
-            parse_mode='HTML'
-        )
-        
-        # Сообщаем клиенту
-        try:
-            await context.bot.send_message(
-                chat_id=deposit['user_id'],
-                text=f"🎉 <b>Счет пополнен!</b>\n\n"
-                     f"💰 Сумма: {deposit['amount']} TMT\n"
-                     f"🆔 Заявка: #{deposit_id}",
-                parse_mode='HTML'
-            )
-        except Exception as e:
-            logger.error(f"❌ Ошибка отправки клиенту: {e}")
-
-# ========== ОТМЕНА ==========
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Отменено")
-    return ConversationHandler.END
-
-# ========== ЗАПУСК ТЕЛЕГРАМ БОТА ==========
-def run_bot():
-    """Запуск Telegram бота"""
-    print("🤖 Начинаем запуск бота...")
-    
-    # Создаем новый event loop для этого потока
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    try:
-        application = Application.builder().token(BOT_TOKEN).build()
-        
-        # ConversationHandler для клиента
-        conv_handler = ConversationHandler(
-            entry_points=[
-                MessageHandler(filters.Regex("^💰 Пополнить счет$"), handle_deposit_button)
-            ],
-            states={
-                WAITING_ID: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_id)
-                ],
-                WAITING_AMOUNT: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_amount)
-                ]
-            },
-            fallbacks=[CommandHandler("cancel", cancel)]
-        )
-        
-        # Обработчики
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(conv_handler)
-        application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-        application.add_handler(CallbackQueryHandler(handle_callback))
-        
-        # Обработчик группы
-        application.add_handler(MessageHandler(
-            filters.TEXT & filters.Chat(chat_id=GROUP_CHAT_ID) & ~filters.COMMAND,
-            handle_group_text
-        ))
-        
-        print("=" * 70)
-        print("🤖 БОТ ЗАПУЩЕН НА RENDER!")
-        print("=" * 70)
-        print(f"Токен: {BOT_TOKEN[:15]}...")
-        print(f"Группа ID: {GROUP_CHAT_ID}")
-        print(f"Админ ID: {ADMIN_IDS}")
-        print("=" * 70)
-        
-        # Запускаем бота
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
-        
-    except Exception as e:
-        print(f"❌ Ошибка запуска бота: {e}")
-        logger.error(f"Ошибка запуска бота: {e}")
-
-# ========== HTTP СЕРВЕР ДЛЯ PING ==========
-from flask import Flask
-import threading
-
+# Инициализация Flask
 app = Flask(__name__)
 
+# Получаем токен и ID группы из переменных окружения (которые вы настроите в Bothost)
+TOKEN = os.environ.get('TOKEN')
+GROUP_ID = int(os.environ.get('GROUP_ID', '-1003759188641'))
+
+# Проверяем, что токен получен
+if not TOKEN:
+    logger.error("Токен не найден! Добавьте TOKEN в переменные окружения Bothost.")
+    TOKEN = "8607427844:AAEI-DnlKJs-iXIsr6XFjFsQjsYZCzwfOw0"  # временно для теста, но лучше использовать переменные окружения
+
+# Инициализация бота
+bot = telegram.Bot(token=TOKEN)
+
+# Состояния для ConversationHandler
+(PHONE_INPUT, AMOUNT_INPUT, WITHDRAW_PHONE_INPUT, 
+ WITHDRAW_AMOUNT_INPUT, WITHDRAW_RECEIPT_INPUT) = range(5)
+
+# Временное хранилище данных пользователей
+user_data = {}
+
+# ================ ФУНКЦИИ ДЛЯ ПРОВЕРКИ ВВОДА ================
+
+def validate_parikara_id(text):
+    """Проверяет, что введены только цифры"""
+    return re.match(r'^\d+$', text) is not None
+
+def validate_amount(text):
+    """Проверяет сумму (минимум 30 TMT и только цифры)"""
+    if re.match(r'^\d+$', text):
+        amount = int(text)
+        if amount >= 30:
+            return True
+    return False
+
+def validate_phone(text):
+    """Проверяет номер телефона (+993 и 8 цифр)"""
+    clean_text = re.sub(r'[\s\-\(\)]', '', text)
+    if re.match(r'^\+993\d{8}$', clean_text):  # +99365123456
+        return True
+    elif re.match(r'^993\d{8}$', clean_text):  # 99365123456
+        return True
+    elif re.match(r'^\d{8}$', clean_text):  # 65123456
+        return True
+    return False
+
+def format_phone(text):
+    """Приводит номер к единому формату +993XXXXXXXX"""
+    clean_text = re.sub(r'[\s\-\(\)]', '', text)
+    if re.match(r'^\d{8}$', clean_text):
+        return f"+993{clean_text}"
+    elif re.match(r'^993\d{8}$', clean_text):
+        return f"+{clean_text}"
+    elif re.match(r'^\+\d{11,}$', clean_text):
+        return clean_text
+    return text
+
+# ================ ОБРАБОТЧИКИ КОМАНД ================
+
+def start(update, context):
+    """Обработчик команды /start"""
+    user = update.effective_user
+    keyboard = [
+        [telegram.KeyboardButton("💰 Hasaby doldurmak")],
+        [telegram.KeyboardButton("💸 Pul çykarmak")]
+    ]
+    reply_markup = telegram.ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
+    welcome_text = (
+        f"Hoş geldiňiz, {user.first_name}! 🤖\n\n"
+        "Astra Kassa botyna hoş geldiňiz.\n"
+        "Hasaby doldurmak ýa-da pul çykarmak üçin aşakdaky düwmeleri ulanyň."
+    )
+    
+    update.message.reply_text(welcome_text, reply_markup=reply_markup)
+    return ConversationHandler.END
+
+def deposit_start(update, context):
+    """Начало процесса пополнения"""
+    user_id = update.effective_user.id
+    user_data[user_id] = {'action': 'deposit'}
+    update.message.reply_text("🔑 Parikara ID-nizi ýazyň:\n(Diňe sanlar)")
+    return PHONE_INPUT
+
+def deposit_phone(update, context):
+    """Получение ID Parikara для пополнения"""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    if validate_parikara_id(text):
+        user_data[user_id]['parikara_id'] = text
+        update.message.reply_text(
+            f"✅ ID kabul edildi: {text}\n\n"
+            "💵 Näçe TMT doldurmaly?\n"
+            "(Iň az 30 TMT, diňe san)"
+        )
+        return AMOUNT_INPUT
+    else:
+        update.message.reply_text("❌ Ýalňyş! Diňe san giriziň.\nParikara ID-nizi täzeden ýazyň:")
+        return PHONE_INPUT
+
+def deposit_amount(update, context):
+    """Получение суммы пополнения"""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    if validate_amount(text):
+        amount = text
+        user_data[user_id]['amount'] = amount
+        
+        # Отправляем заявку в группу администраторов
+        user = update.effective_user
+        username = user.username or "ýok"
+        
+        group_message = (
+            f"🟢 TÄZE HAÝYŞ: HASABY DOLDURMAK\n\n"
+            f"Ulanyjy: @{username}\n"
+            f"ID: {user_data[user_id]['parikara_id']}\n"
+            f"Summa: {amount} TMT"
+        )
+        
+        bot.send_message(chat_id=GROUP_ID, text=group_message)
+        
+        update.message.reply_text(
+            "✅ Haýyşyňyz kabul edildi!\n\n"
+            "📞 Töleg maglumatlary 10 minudyň içinde ugradylar.\n"
+            "Tölegiňizi geçireniňizden soň, skrinşoty ugratmagy unutmaň."
+        )
+        
+        # Очищаем данные пользователя
+        del user_data[user_id]
+        return ConversationHandler.END
+    else:
+        update.message.reply_text("❌ Ýalňyş summa! Iň az 30 TMT bolmaly.\nTäzeden ýazyň:")
+        return AMOUNT_INPUT
+
+def withdraw_start(update, context):
+    """Начало процесса вывода средств"""
+    user_id = update.effective_user.id
+    user_data[user_id] = {'action': 'withdraw'}
+    update.message.reply_text("🔑 Parikara ID-nizi ýazyň:\n(Diňe sanlar)")
+    return WITHDRAW_PHONE_INPUT
+
+def withdraw_phone(update, context):
+    """Получение ID Parikara для вывода"""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    if validate_parikara_id(text):
+        user_data[user_id]['parikara_id'] = text
+        update.message.reply_text(
+            f"✅ ID kabul edildi: {text}\n\n"
+            "💵 Näçe TMT çykarmaly?\n(Diňe san)"
+        )
+        return WITHDRAW_AMOUNT_INPUT
+    else:
+        update.message.reply_text("❌ Ýalňyş! Diňe san giriziň.\nParikara ID-nizi täzeden ýazyň:")
+        return WITHDRAW_PHONE_INPUT
+
+def withdraw_amount(update, context):
+    """Получение суммы вывода"""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    if re.match(r'^\d+$', text):
+        amount = text
+        user_data[user_id]['amount'] = amount
+        update.message.reply_text(
+            f"✅ Summa kabul edildi: {amount} TMT\n\n"
+            "📞 Telefon nomeriňizi ýazyň:\n"
+            "(Mysal: +99365123456 ýa-da 65123456)"
+        )
+        return WITHDRAW_RECEIPT_INPUT
+    else:
+        update.message.reply_text("❌ Ýalňyş! Diňe san giriziň.\nTäzeden ýazyň:")
+        return WITHDRAW_AMOUNT_INPUT
+
+def withdraw_receipt(update, context):
+    """Получение номера телефона для вывода"""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    if validate_phone(text):
+        phone = format_phone(text)
+        user = update.effective_user
+        username = user.username or "ýok"
+        
+        group_message = (
+            f"🔴 TÄZE HAÝYŞ: PUL ÇYKARMAK\n\n"
+            f"Ulanyjy: @{username}\n"
+            f"ID: {user_data[user_id]['parikara_id']}\n"
+            f"Summa: {user_data[user_id]['amount']} TMT\n"
+            f"Telefon: {phone}"
+        )
+        
+        bot.send_message(chat_id=GROUP_ID, text=group_message)
+        
+        update.message.reply_text(
+            "✅ Haýyşyňyz kabul edildi!\n\n"
+            "💸 Pul çykarmak haýyşyňyz işlenilýär.\n"
+            "Administratorlar tizara habarlaşarlar."
+        )
+        
+        # Очищаем данные пользователя
+        del user_data[user_id]
+        return ConversationHandler.END
+    else:
+        update.message.reply_text(
+            "❌ Ýalňyş telefon nomeri!\n"
+            "Dogry format: +99365123456 ýa-da 65123456\n"
+            "Täzeden ýazyň:"
+        )
+        return WITHDRAW_RECEIPT_INPUT
+
+def cancel(update, context):
+    """Отмена действия"""
+    user_id = update.effective_user.id
+    if user_id in user_data:
+        del user_data[user_id]
+    update.message.reply_text("❌ Amal ýatyryldy.\nTäzeden başlamak üçin /start basyň.")
+    return ConversationHandler.END
+
+def handle_screenshot(update, context):
+    """Обрабатывает получение скриншотов"""
+    if update.message.photo:
+        photo = update.message.photo[-1]
+        file_id = photo.file_id
+        user = update.effective_user
+        username = user.username or "ýok"
+        
+        bot.send_photo(
+            chat_id=GROUP_ID, 
+            photo=file_id,
+            caption=f"🖼 TÄZE SKRINŞOT\n\nUlanyjy: @{username}"
+        )
+        update.message.reply_text("✅ Skrinşot kabul edildi!")
+    else:
+        update.message.reply_text("❌ Surat ugradyň!")
+
+# ================ НАСТРОЙКА ОБРАБОТЧИКОВ ================
+
+def setup_dispatcher():
+    """Создаёт и настраивает диспетчер"""
+    dispatcher = Dispatcher(bot, None, workers=0)
+    
+    # Обработчик диалога пополнения
+    deposit_conv = ConversationHandler(
+        entry_points=[MessageHandler(Filters.regex('^💰 Hasaby doldurmak$'), deposit_start)],
+        states={
+            PHONE_INPUT: [MessageHandler(Filters.text & ~Filters.command, deposit_phone)],
+            AMOUNT_INPUT: [MessageHandler(Filters.text & ~Filters.command, deposit_amount)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    )
+    
+    # Обработчик диалога вывода
+    withdraw_conv = ConversationHandler(
+        entry_points=[MessageHandler(Filters.regex('^💸 Pul çykarmak$'), withdraw_start)],
+        states={
+            WITHDRAW_PHONE_INPUT: [MessageHandler(Filters.text & ~Filters.command, withdraw_phone)],
+            WITHDRAW_AMOUNT_INPUT: [MessageHandler(Filters.text & ~Filters.command, withdraw_amount)],
+            WITHDRAW_RECEIPT_INPUT: [MessageHandler(Filters.text & ~Filters.command, withdraw_receipt)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    )
+    
+    dispatcher.add_handler(CommandHandler('start', start))
+    dispatcher.add_handler(deposit_conv)
+    dispatcher.add_handler(withdraw_conv)
+    dispatcher.add_handler(MessageHandler(Filters.photo, handle_screenshot))
+    
+    return dispatcher
+
+dispatcher = setup_dispatcher()
+
+# ================ ВЕБХУК ================
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Точка входа для вебхуков Telegram"""
+    try:
+        update = telegram.Update.de_json(request.get_json(force=True), bot)
+        dispatcher.process_update(update)
+        return jsonify({'status': 'ok'})
+    except Exception as e:
+        logger.error(f"Ошибка в webhook: {e}")
+        return jsonify({'status': 'error', 'message': str(e)})
+
 @app.route('/')
-def home():
-    return "🤖 Telegram Bot is running on Render!"
+def index():
+    return 'Astra Kassa Bot is running!'
 
-@app.route('/health')
-def health():
-    return "✅ OK"
-
-@app.route('/ping')
-def ping():
-    return "🏓 Pong!"
-
-def run_flask():
-    """Запуск Flask сервера"""
-    app.run(host='0.0.0.0', port=10000, debug=False, use_reloader=False)
-
-# ========== ОСНОВНОЙ ЗАПУСК ==========
-def main():
-    """Главная функция запуска"""
-    print("🚀 Запуск приложения...")
-    
-    # Запускаем Flask в отдельном потоке
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    
-    # Небольшая задержка для запуска Flask
-    time.sleep(2)
-    
-    # Запускаем бота в основном потоке
-    run_bot()
-
+# Для локального тестирования
 if __name__ == '__main__':
-    main()
+    app.run(host='0.0.0.0', port=5000)
